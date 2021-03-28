@@ -56,7 +56,7 @@ namespace msckf_vio
     {
       int grid_row;
       int grid_col;
-      int grid_min_feature_num;
+      int grid_min_feature_num; //每
       int grid_max_feature_num;
 
       int pyramid_levels; //金字塔层数
@@ -73,15 +73,12 @@ namespace msckf_vio
    */
     typedef unsigned long long int FeatureIDType;
 
-    /*
-   * @brief FeatureMetaData Contains necessary information
-   *    of a feature for easy access.
-   */
+    //一对特征点的数据结构
     struct FeatureMetaData
     {
       FeatureIDType id;
-      float response;
-      int lifetime;
+      float response; //cam0的响应值
+      int lifetime;   //存活了几帧
       cv::Point2f cam0_point;
       cv::Point2f cam1_point;
     };
@@ -105,18 +102,15 @@ namespace msckf_vio
       // beginning of the vector.
       return pt1.response > pt2.response;
     }
-    /*
-   * @brief featureCompareByResponse
-   *    Compare two features based on the response.
-   */
+
+    //用于sort排序
     static bool featureCompareByResponse(
         const FeatureMetaData &f1,
         const FeatureMetaData &f2)
     {
-      // Features with higher response will be at the
-      // beginning of the vector.
       return f1.response > f2.response;
     }
+
     /*
    * @brief featureCompareByLifetime
    *    Compare two features based on the lifetime.
@@ -369,7 +363,7 @@ namespace msckf_vio
     std::vector<cv::Mat> curr_cam0_pyramid_;
     std::vector<cv::Mat> curr_cam1_pyramid_;
 
-    // Features in the previous and current image.
+    //过去和当前的特征点对
     boost::shared_ptr<GridFeatures> prev_features_ptr;
     boost::shared_ptr<GridFeatures> curr_features_ptr;
 

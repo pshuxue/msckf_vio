@@ -193,7 +193,6 @@ namespace msckf_vio
     stereo_sub.registerCallback(&ImageProcessor::stereoCallback, this);
     imu_sub = nh.subscribe("imu", 50,
                            &ImageProcessor::imuCallback, this);
-
     return true;
   }
 
@@ -222,7 +221,6 @@ namespace msckf_vio
       const sensor_msgs::ImageConstPtr &cam0_img,
       const sensor_msgs::ImageConstPtr &cam1_img)
   {
-
     // 图像接收
     cam0_curr_img_ptr = cv_bridge::toCvShare(cam0_img,
                                              sensor_msgs::image_encodings::MONO8);
@@ -235,7 +233,7 @@ namespace msckf_vio
     if (is_first_img)
     {
       ros::Time start_time = ros::Time::now();
-      initializeFirstFrame();
+      initializeFirstFrame(); //初始化第一帧
 
       is_first_img = false;
 
@@ -244,29 +242,17 @@ namespace msckf_vio
     }
     else
     {
-      // Track the feature in the previous image.
       ros::Time start_time = ros::Time::now();
       trackFeatures();
-      //ROS_INFO("Tracking time: %f",
-      //    (ros::Time::now()-start_time).toSec());
 
-      // Add new features into the current image.
       start_time = ros::Time::now();
       addNewFeatures();
-      //ROS_INFO("Addition time: %f",
-      //    (ros::Time::now()-start_time).toSec());
 
-      // Add new features into the current image.
       start_time = ros::Time::now();
       pruneGridFeatures();
-      //ROS_INFO("Prune grid features: %f",
-      //    (ros::Time::now()-start_time).toSec());
 
-      // Draw results.
       start_time = ros::Time::now();
       drawFeaturesStereo();
-      //ROS_INFO("Draw features: %f",
-      //    (ros::Time::now()-start_time).toSec());
     }
 
     //ros::Time start_time = ros::Time::now();
@@ -324,6 +310,10 @@ namespace msckf_vio
         BORDER_CONSTANT, false);
   }
 
+  //对当前的 cam0 的图像进行特征点提取,然后调用 stereoMatch 函数对前两帧进行匹配并去除外点,
+  //得到匹配好的内点并计算响应值,然后将匹配好的每一对点打包放入数据结构 GridFeatures 中,
+  //然后将这些点对按照响应值排序(响应值是 cam0 中的),将这些点按照网格
+  //存入 curr_features_ptr 变量中。函数结束
   void ImageProcessor::initializeFirstFrame()
   {
     // Size of each grid.
@@ -335,16 +325,15 @@ namespace msckf_vio
     vector<KeyPoint> new_features(0);
     detector_ptr->detect(img, new_features);
 
-    // Find the stereo matched points for the newly
-    // detected features.
+    // 利用双目视觉的约束关系计算cam1中对应cam0的匹配点
     vector<cv::Point2f> cam0_points(new_features.size());
     for (int i = 0; i < new_features.size(); ++i)
       cam0_points[i] = new_features[i].pt;
-
     vector<cv::Point2f> cam1_points(0);
     vector<unsigned char> inlier_markers(0);
     stereoMatch(cam0_points, cam1_points, inlier_markers);
 
+    //将内点保存
     vector<cv::Point2f> cam0_inliers(0);
     vector<cv::Point2f> cam1_inliers(0);
     vector<float> response_inliers(0);
@@ -357,19 +346,17 @@ namespace msckf_vio
       response_inliers.push_back(new_features[i].response);
     }
 
-    // Group the features into grids
+    // 将特征点匹配后的内点存入grid（可以加速后续特征匹配）
     GridFeatures grid_new_features;
     for (int code = 0; code <
                        processor_config.grid_row * processor_config.grid_col;
          ++code)
       grid_new_features[code] = vector<FeatureMetaData>(0);
-
     for (int i = 0; i < cam0_inliers.size(); ++i)
     {
       const cv::Point2f &cam0_point = cam0_inliers[i];
       const cv::Point2f &cam1_point = cam1_inliers[i];
       const float &response = response_inliers[i];
-
       int row = static_cast<int>(cam0_point.y / grid_height);
       int col = static_cast<int>(cam0_point.x / grid_width);
       int code = row * processor_config.grid_col + col;
@@ -381,19 +368,18 @@ namespace msckf_vio
       grid_new_features[code].push_back(new_feature);
     }
 
-    // Sort the new features in each grid based on its response.
+    // 将每个grid中的特征点根据响应值排序
     for (auto &item : grid_new_features)
       std::sort(item.second.begin(), item.second.end(),
                 &ImageProcessor::featureCompareByResponse);
 
-    // Collect new features within each grid with high response.
+    // 只将响应值排名靠前的保存到curr_features_ptr
     for (int code = 0; code <
                        processor_config.grid_row * processor_config.grid_col;
          ++code)
     {
       vector<FeatureMetaData> &features_this_grid = (*curr_features_ptr)[code];
       vector<FeatureMetaData> &new_features_this_grid = grid_new_features[code];
-
       for (int k = 0; k < processor_config.grid_min_feature_num &&
                       k < new_features_this_grid.size();
            ++k)
@@ -403,10 +389,13 @@ namespace msckf_vio
         features_this_grid.back().lifetime = 1;
       }
     }
-
     return;
   }
 
+  //输入四个参数,依次是输入过去帧的像素坐标、前后帧旋转矩阵(imu 弄出来的)、内参、输出当前帧的像素坐标。
+  //其实就是通过前后帧的内外参映射,将过去帧的特征点投影到当前帧返回投影后的坐标
+  //其实这个预测并没有输入前后帧的相对平移,这是因为 imu 直接用加速度是
+  //得不到平移的,必须要知道速度,因此这里的预测只考虑了旋转矩阵,认为平移量是 0，所以这个点并不是过去帧对应的匹配点
   void ImageProcessor::predictFeatureTracking(
       const vector<cv::Point2f> &input_pts,
       const cv::Matx33f &R_p_c,
@@ -448,18 +437,16 @@ namespace msckf_vio
     static int grid_width =
         cam0_curr_img_ptr->image.cols / processor_config.grid_col;
 
-    // Compute a rough relative rotation which takes a vector
-    // from the previous frame to the current frame.
+    //计算时间上前后相机之间的相对旋转，cam0和cam1两个旋转矩阵
     Matx33f cam0_R_p_c;
     Matx33f cam1_R_p_c;
     integrateImuData(cam0_R_p_c, cam1_R_p_c);
 
-    // Organize the features in the previous image.
+    // 取出过去帧中的匹配点对的信息
     vector<FeatureIDType> prev_ids(0);
     vector<int> prev_lifetime(0);
     vector<Point2f> prev_cam0_points(0);
     vector<Point2f> prev_cam1_points(0);
-
     for (const auto &item : *prev_features_ptr)
     {
       for (const auto &prev_feature : item.second)
@@ -471,21 +458,21 @@ namespace msckf_vio
       }
     }
 
-    // Number of the features before tracking.
+    // 跟踪之前的点数
     before_tracking = prev_cam0_points.size();
-
     // Abort tracking if there is no features in
     // the previous frame.
     if (prev_ids.size() == 0)
       return;
 
-    // Track features using LK optical flow method.
+    // 光流追踪
     vector<Point2f> curr_cam0_points(0);
     vector<unsigned char> track_inliers(0);
 
+    //使用imu得到的前后帧相对旋转，将上一帧图像中的特征点投影到当前帧(这个肯定不准)
     predictFeatureTracking(prev_cam0_points,
                            cam0_R_p_c, cam0_intrinsics, curr_cam0_points);
-
+    //上一步投影不准由于相对旋转是imu算出来的，这里在上一步的基础上使用LK光流跟踪
     calcOpticalFlowPyrLK(
         prev_cam0_pyramid_, curr_cam0_pyramid_,
         prev_cam0_points, curr_cam0_points,
@@ -497,8 +484,7 @@ namespace msckf_vio
                      processor_config.track_precision),
         cv::OPTFLOW_USE_INITIAL_FLOW);
 
-    // Mark those tracked points out of the image region
-    // as untracked.
+    //保留在图像范围内的点
     for (int i = 0; i < curr_cam0_points.size(); ++i)
     {
       if (track_inliers[i] == 0)
@@ -510,13 +496,12 @@ namespace msckf_vio
         track_inliers[i] = 0;
     }
 
-    // Collect the tracked points.
+    // 取出上一步跟踪到的点（内点）
     vector<FeatureIDType> prev_tracked_ids(0);
     vector<int> prev_tracked_lifetime(0);
     vector<Point2f> prev_tracked_cam0_points(0);
     vector<Point2f> prev_tracked_cam1_points(0);
     vector<Point2f> curr_tracked_cam0_points(0);
-
     removeUnmarkedElements(
         prev_ids, track_inliers, prev_tracked_ids);
     removeUnmarkedElements(
@@ -528,39 +513,22 @@ namespace msckf_vio
     removeUnmarkedElements(
         curr_cam0_points, track_inliers, curr_tracked_cam0_points);
 
-    // Number of features left after tracking.
+    // 跟踪之后的点数
     after_tracking = curr_tracked_cam0_points.size();
 
-    // Outlier removal involves three steps, which forms a close
-    // loop between the previous and current frames of cam0 (left)
-    // and cam1 (right). Assuming the stereo matching between the
-    // previous cam0 and cam1 images are correct, the three steps are:
-    //
-    // prev frames cam0 ----------> cam1
-    //              |                |
-    //              |ransac          |ransac
-    //              |   stereo match |
-    // curr frames cam0 ----------> cam1
-    //
-    // 1) Stereo matching between current images of cam0 and cam1.
-    // 2) RANSAC between previous and current images of cam0.
-    // 3) RANSAC between previous and current images of cam1.
-    //
-    // For Step 3, tracking between the images is no longer needed.
-    // The stereo matching results are directly used in the RANSAC.
-
-    // Step 1: stereo matching.
+    // 两个相机之间的匹配（在cam1中根据相机外参找cam0中的特征点的对应点）
     vector<Point2f> curr_cam1_points(0);
     vector<unsigned char> match_inliers(0);
     stereoMatch(curr_tracked_cam0_points, curr_cam1_points, match_inliers);
 
+    //再去除一次外点，相当于在过去的点对中，先是通过cam0的前后帧track，找到内点，去掉外点
+    //这里再一次使用cam0和cam1当前帧进行匹配后再一次去除匹配外点
     vector<FeatureIDType> prev_matched_ids(0);
     vector<int> prev_matched_lifetime(0);
     vector<Point2f> prev_matched_cam0_points(0);
     vector<Point2f> prev_matched_cam1_points(0);
     vector<Point2f> curr_matched_cam0_points(0);
     vector<Point2f> curr_matched_cam1_points(0);
-
     removeUnmarkedElements(
         prev_tracked_ids, match_inliers, prev_matched_ids);
     removeUnmarkedElements(
@@ -574,7 +542,7 @@ namespace msckf_vio
     removeUnmarkedElements(
         curr_cam1_points, match_inliers, curr_matched_cam1_points);
 
-    // Number of features left after stereo matching.
+    // 最后还剩下多少点对
     after_matching = curr_matched_cam0_points.size();
 
     // Step 2 and 3: RANSAC on temporal image pairs of cam0 and cam1.
@@ -629,13 +597,6 @@ namespace msckf_vio
                       curr_feature_num, prev_feature_num,
                       static_cast<double>(curr_feature_num) /
                           (static_cast<double>(prev_feature_num) + 1e-5));
-    //printf(
-    //    "\033[0;32m candidates: %d; raw track: %d; stereo match: %d; ransac: %d/%d=%f\033[0m\n",
-    //    before_tracking, after_tracking, after_matching,
-    //    curr_feature_num, prev_feature_num,
-    //    static_cast<double>(curr_feature_num)/
-    //    (static_cast<double>(prev_feature_num)+1e-5));
-
     return;
   }
 
@@ -991,10 +952,15 @@ namespace msckf_vio
     return pts_out;
   }
 
+  //在 imu 的缓冲区中寻找上一帧图像的时间戳最接近的作为起点,当前帧图像
+  //的时间戳最接近的作为终点,将这段时间中的三个角速度变换到 cam0 和
+  //cam1 的坐标系中,然后分别对角速度求一个平均值,然后乘以起点与终点之
+  //间的时间差,将这两个结果分别变换为旋转矩阵返回。
+  //(无非是求解 cam0 和 cam1前后帧的旋转矩阵),更新两个输入参数。
   void ImageProcessor::integrateImuData(
       Matx33f &cam0_R_p_c, Matx33f &cam1_R_p_c)
   {
-    // Find the start and the end limit within the imu msg buffer.
+    // 找到前一帧和后一帧最近的时间点，记为开始和结束
     auto begin_iter = imu_msg_buffer.begin();
     while (begin_iter != imu_msg_buffer.end())
     {
@@ -1005,7 +971,6 @@ namespace msckf_vio
       else
         break;
     }
-
     auto end_iter = begin_iter;
     while (end_iter != imu_msg_buffer.end())
     {
@@ -1017,21 +982,17 @@ namespace msckf_vio
         break;
     }
 
-    // Compute the mean angular velocity in the IMU frame.
+    // 计算开始和结束时间内的平均角速度
     Vec3f mean_ang_vel(0.0, 0.0, 0.0);
     for (auto iter = begin_iter; iter < end_iter; ++iter)
       mean_ang_vel += Vec3f(iter->angular_velocity.x,
                             iter->angular_velocity.y, iter->angular_velocity.z);
-
     if (end_iter - begin_iter > 0)
       mean_ang_vel *= 1.0f / (end_iter - begin_iter);
 
-    // Transform the mean angular velocity from the IMU
-    // frame to the cam0 and cam1 frames.
+    // 求解出前后两个相机的旋转矩阵（但是感觉这里求解出的是第k相机帧和k+1帧的IMU之间的相对旋转）
     Vec3f cam0_mean_ang_vel = R_cam0_imu.t() * mean_ang_vel;
     Vec3f cam1_mean_ang_vel = R_cam1_imu.t() * mean_ang_vel;
-
-    // Compute the relative rotation.
     double dtime = (cam0_curr_img_ptr->header.stamp -
                     cam0_prev_img_ptr->header.stamp)
                        .toSec();
@@ -1040,7 +1001,7 @@ namespace msckf_vio
     cam0_R_p_c = cam0_R_p_c.t();
     cam1_R_p_c = cam1_R_p_c.t();
 
-    // Delete the useless and used imu messages.
+    // 删除IMU缓冲区对应的数据
     imu_msg_buffer.erase(imu_msg_buffer.begin(), end_iter);
     return;
   }
