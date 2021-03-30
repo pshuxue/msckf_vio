@@ -429,6 +429,8 @@ namespace msckf_vio
     return;
   }
 
+  //进行特征点的追踪，使用光流的方法追踪前后帧的点，也用了RANASAC的方法剔除外点
+  //实际中track肯定会使得追踪到的点变少，所以后续要加入新的特征点
   void ImageProcessor::trackFeatures()
   {
     // Size of each grid.
@@ -496,7 +498,7 @@ namespace msckf_vio
         track_inliers[i] = 0;
     }
 
-    // 取出上一步跟踪到的点（内点）
+    // 取出上一步跟踪到的点（内点）,内点都是相对前后帧说的
     vector<FeatureIDType> prev_tracked_ids(0);
     vector<int> prev_tracked_lifetime(0);
     vector<Point2f> prev_tracked_cam0_points(0);
@@ -545,22 +547,21 @@ namespace msckf_vio
     // 最后还剩下多少点对
     after_matching = curr_matched_cam0_points.size();
 
-    // Step 2 and 3: RANSAC on temporal image pairs of cam0 and cam1.
+    // 通过RANSAC的方法进行前后帧的外点剔除
     vector<int> cam0_ransac_inliers(0);
     twoPointRansac(prev_matched_cam0_points, curr_matched_cam0_points,
                    cam0_R_p_c, cam0_intrinsics, cam0_distortion_model,
                    cam0_distortion_coeffs, processor_config.ransac_threshold,
                    0.99, cam0_ransac_inliers);
-
     vector<int> cam1_ransac_inliers(0);
     twoPointRansac(prev_matched_cam1_points, curr_matched_cam1_points,
                    cam1_R_p_c, cam1_intrinsics, cam1_distortion_model,
                    cam1_distortion_coeffs, processor_config.ransac_threshold,
                    0.99, cam1_ransac_inliers);
 
-    // Number of features after ransac.
+    //将经过RANSAC后的点保存在curr_features_ptr，注意在MSCKF中每次处理后保存的点都是以点对的形式保存
+    //即这个点必须要同时出现在cam0和cam1中，不会单独存放只在cam0中出现的点
     after_ransac = 0;
-
     for (int i = 0; i < cam0_ransac_inliers.size(); ++i)
     {
       if (cam0_ransac_inliers[i] == 0 ||
@@ -582,7 +583,7 @@ namespace msckf_vio
       ++after_ransac;
     }
 
-    // Compute the tracking rate.
+    //计算一下追踪前后的点数，打印
     int prev_feature_num = 0;
     for (const auto &item : *prev_features_ptr)
       prev_feature_num += item.second.size();
@@ -691,26 +692,25 @@ namespace msckf_vio
     return;
   }
 
+  //光流跟踪会使得点数变少，所以此处补充新的光流点
   void ImageProcessor::addNewFeatures()
   {
     const Mat &curr_img = cam0_curr_img_ptr->image;
 
-    // Size of each grid.
+    //计算有多少格子
     static int grid_height =
         cam0_curr_img_ptr->image.rows / processor_config.grid_row;
     static int grid_width =
         cam0_curr_img_ptr->image.cols / processor_config.grid_col;
 
-    // Create a mask to avoid redetecting existing features.
+    // 创建mask，将已经存在的光流点标记，后续可以避免反复提取
     Mat mask(curr_img.rows, curr_img.cols, CV_8U, Scalar(1));
-
     for (const auto &features : *curr_features_ptr)
     {
       for (const auto &feature : features.second)
       {
         const int y = static_cast<int>(feature.cam0_point.y);
         const int x = static_cast<int>(feature.cam0_point.x);
-
         int up_lim = y - 2, bottom_lim = y + 3,
             left_lim = x - 2, right_lim = x + 3;
         if (up_lim < 0)
@@ -721,19 +721,17 @@ namespace msckf_vio
           left_lim = 0;
         if (right_lim > curr_img.cols)
           right_lim = curr_img.cols;
-
         Range row_range(up_lim, bottom_lim);
         Range col_range(left_lim, right_lim);
         mask(row_range, col_range) = 0;
       }
     }
 
-    // Detect new features.
+    // 提取新的特征点
     vector<KeyPoint> new_features(0);
     detector_ptr->detect(curr_img, new_features, mask);
 
-    // Collect the new detected features based on the grid.
-    // Select the ones with top response within each grid afterwards.
+    // 创建新的格子，将新提取的特征点放入格子
     vector<vector<KeyPoint>> new_feature_sieve(
         processor_config.grid_row * processor_config.grid_col);
     for (const auto &feature : new_features)
@@ -742,8 +740,9 @@ namespace msckf_vio
       int col = static_cast<int>(feature.pt.x / grid_width);
       new_feature_sieve[row * processor_config.grid_col + col].push_back(feature);
     }
-
     new_features.clear();
+
+    //将每个格子中的特征点只取前几个response较大的保存
     for (auto &item : new_feature_sieve)
     {
       if (item.size() > processor_config.grid_max_feature_num)
@@ -755,7 +754,6 @@ namespace msckf_vio
       }
       new_features.insert(new_features.end(), item.begin(), item.end());
     }
-
     int detected_new_features = new_features.size();
 
     // Find the stereo matched points for the newly
@@ -1029,6 +1027,7 @@ namespace msckf_vio
     return;
   }
 
+  //通过RANSAC的方法，使用对极约束进行外点剔除，有一些技巧
   void ImageProcessor::twoPointRansac(
       const vector<Point2f> &pts1, const vector<Point2f> &pts2,
       const cv::Matx33f &R_p_c, const cv::Vec4d &intrinsics,

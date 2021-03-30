@@ -363,7 +363,7 @@ namespace msckf_vio
     std::vector<cv::Mat> curr_cam0_pyramid_;
     std::vector<cv::Mat> curr_cam1_pyramid_;
 
-    //过去和当前的特征点对
+    //过去和当前的特征点对(一对代表的是左右两帧图像都出现的点)
     boost::shared_ptr<GridFeatures> prev_features_ptr;
     boost::shared_ptr<GridFeatures> curr_features_ptr;
 
