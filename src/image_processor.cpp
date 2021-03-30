@@ -521,7 +521,7 @@ namespace msckf_vio
     vector<unsigned char> match_inliers(0);
     stereoMatch(curr_tracked_cam0_points, curr_cam1_points, match_inliers);
 
-    //再去除一次外点，相当于在过去的点对中，先是通过cam0的前后帧track，找到内点，去掉外点
+    //再去除一次外点，相当于在过去的点对中，先是通过cam0的前后帧track，找到内点，去掉外点(上一步)
     //这里再一次使用cam0和cam1当前帧进行匹配后再一次去除匹配外点
     vector<FeatureIDType> prev_matched_ids(0);
     vector<int> prev_matched_lifetime(0);
@@ -1006,6 +1006,7 @@ namespace msckf_vio
     return;
   }
 
+  //重新算一个尺度，但是这个算法也是一种近似，就是根据点到相机原点的平均距离给定尺度因子
   void ImageProcessor::rescalePoints(
       vector<Point2f> &pts1, vector<Point2f> &pts2,
       float &scaling_factor)
@@ -1018,16 +1019,13 @@ namespace msckf_vio
       scaling_factor += sqrt(pts1[i].dot(pts1[i]));
       scaling_factor += sqrt(pts2[i].dot(pts2[i]));
     }
-
     scaling_factor = (pts1.size() + pts2.size()) /
                      scaling_factor * sqrt(2.0f);
-
     for (int i = 0; i < pts1.size(); ++i)
     {
       pts1[i] *= scaling_factor;
       pts2[i] *= scaling_factor;
     }
-
     return;
   }
 
@@ -1048,13 +1046,13 @@ namespace msckf_vio
 
     double norm_pixel_unit = 2.0 / (intrinsics[0] + intrinsics[1]);
     int iter_num = static_cast<int>(
-        ceil(log(1 - success_probability) / log(1 - 0.7 * 0.7)));
+        ceil(log(1 - success_probability) / log(1 - 0.7 * 0.7))); //RANSAC的迭代次数
 
     // Initially, mark all points as inliers.
     inlier_markers.clear();
     inlier_markers.resize(pts1.size(), 1);
 
-    // Undistort all the points.
+    //前后两帧解畸变
     vector<Point2f> pts1_undistorted(pts1.size());
     vector<Point2f> pts2_undistorted(pts2.size());
     undistortPoints(
@@ -1064,8 +1062,7 @@ namespace msckf_vio
         pts2, intrinsics, distortion_model,
         distortion_coeffs, pts2_undistorted);
 
-    // Compenstate the points in the previous image with
-    // the relative rotation.
+    // 根据相对旋转将过去帧旋转到现在帧
     for (auto &pt : pts1_undistorted)
     {
       Vec3f pt_h(pt.x, pt.y, 1.0f);
@@ -1075,28 +1072,22 @@ namespace msckf_vio
       pt.y = pt_hc[1];
     }
 
-    // Normalize the points to gain numerical stability.
+    // 根据像素点到相机的距离，给定一个尺度（并非真实尺度）
     float scaling_factor = 0.0f;
     rescalePoints(pts1_undistorted, pts2_undistorted, scaling_factor);
     norm_pixel_unit *= scaling_factor;
 
-    // Compute the difference between previous and current points,
-    // which will be used frequently later.
+    // 计算经过上面变换后的过去帧和当前帧特征点之间的差值距离
     vector<Point2d> pts_diff(pts1_undistorted.size());
     for (int i = 0; i < pts1_undistorted.size(); ++i)
       pts_diff[i] = pts1_undistorted[i] - pts2_undistorted[i];
 
-    // Mark the point pairs with large difference directly.
-    // BTW, the mean distance of the rest of the point pairs
-    // are computed.
+    // 遍历上面的差值距离，求一个平均值mean_pt_distance，如果某一个点的差值过大，将其标记为外点
     double mean_pt_distance = 0.0;
     int raw_inlier_cntr = 0;
     for (int i = 0; i < pts_diff.size(); ++i)
     {
       double distance = sqrt(pts_diff[i].dot(pts_diff[i]));
-      // 25 pixel distance is a pretty large tolerance for normal motion.
-      // However, to be used with aggressive motion, this tolerance should
-      // be increased significantly to match the usage.
       if (distance > 50.0 * norm_pixel_unit)
       {
         inlier_markers[i] = 0;
@@ -1109,9 +1100,7 @@ namespace msckf_vio
     }
     mean_pt_distance /= raw_inlier_cntr;
 
-    // If the current number of inliers is less than 3, just mark
-    // all input as outliers. This case can happen with fast
-    // rotation where very few features are tracked.
+    //如果当前内点太少，那就将所有点标记为外点直接输出，这种情况是因为发生了快速旋转
     if (raw_inlier_cntr < 3)
     {
       for (auto &marker : inlier_markers)
@@ -1119,12 +1108,8 @@ namespace msckf_vio
       return;
     }
 
-    // Before doing 2-point RANSAC, we have to check if the motion
-    // is degenerated, meaning that there is no translation between
-    // the frames, in which case, the model of the RANSAC does not
-    // work. If so, the distance between the matched points will
-    // be almost 0.
-    //if (mean_pt_distance < inlier_error*norm_pixel_unit) {
+    //如果上面计算的平均距离过小，相当于只是发生了纯旋转，平移量很小，前一帧大部分点经过旋转都能够和当前帧吻合
+    //那就将距离太大的直接舍掉，函数返回即可
     if (mean_pt_distance < norm_pixel_unit)
     {
       //ROS_WARN_THROTTLE(1.0, "Degenerated motion...");
@@ -1139,8 +1124,22 @@ namespace msckf_vio
       return;
     }
 
-    // In the case of general motion, the RANSAC model can be applied.
-    // The three column corresponds to tx, ty, and tz respectively.
+    //接下来是一个比较有技巧性的剔除外点策略，由于上面已经检测不是发生了纯旋转，也就是说满足了极线约束，有p2T*(t^R)*p1=0
+    //经过变化p2T*(t^R)*p1=-p2T*(R*p1)^*t=-[(R*p1)^*p2]T * t=0
+    //其中R*p1就是变量pts1_undistorted(上面已经加入了旋转)，p2就是变量pts2_undistorted
+    //于是应满足的等式变为pts1_undistorted的反对称乘pts2_undistorted的积的转置，乘以t等于0
+    //将其构造等式为pts1_undistorted^*pts2_undistorted=(a1  a2  a3),由于存在多个pts1_undistorted，随机选取两组点构成：
+    //      a1   a2   a3         tx
+    //      b1   b2   b3   *   ty    =   0
+    //                                    tz
+    //由于t存在尺度问题，根据实际情况，将txtytz分别赋值为1，加入tx=1，则：
+    //         a2   a3        ty          -a1
+    //         b2   b3   *   tz    =   -b1
+    // 所以下面的RANSAC就是先找出两组点，求出(tx,ty,tz)(其中一项为1),利用求解出的t(也就是后面的A)，进行外点剔除，因为所有的内点都应该满足：
+    //      a1   a2   a3         tx
+    //      b1   b2   b3   *   ty    =   0
+    //                                    tz
+    //直到这个函数结束
     MatrixXd coeff_t(pts_diff.size(), 3);
     for (int i = 0; i < pts_diff.size(); ++i)
     {
@@ -1150,6 +1149,7 @@ namespace msckf_vio
                       pts1_undistorted[i].y * pts2_undistorted[i].x;
     }
 
+    //目前还是内点的，保存
     vector<int> raw_inlier_idx;
     for (int i = 0; i < inlier_markers.size(); ++i)
     {
@@ -1163,32 +1163,29 @@ namespace msckf_vio
 
     for (int iter_idx = 0; iter_idx < iter_num; ++iter_idx)
     {
-      // Randomly select two point pairs.
-      // Although this is a weird way of selecting two pairs, but it
-      // is able to efficiently avoid selecting repetitive pairs.
+      // 随机选取两个点
       int select_idx1 = random_gen.uniformInteger(
           0, raw_inlier_idx.size() - 1);
       int select_idx_diff = random_gen.uniformInteger(
           1, raw_inlier_idx.size() - 1);
       int select_idx2 = select_idx1 + select_idx_diff < raw_inlier_idx.size() ? select_idx1 + select_idx_diff : select_idx1 + select_idx_diff - raw_inlier_idx.size();
-
       int pair_idx1 = raw_inlier_idx[select_idx1];
       int pair_idx2 = raw_inlier_idx[select_idx2];
 
-      // Construct the model;
+      // 根据实际选择合理的模型，即决定txtytz哪一个变量是1
       Vector2d coeff_tx(coeff_t(pair_idx1, 0), coeff_t(pair_idx2, 0));
       Vector2d coeff_ty(coeff_t(pair_idx1, 1), coeff_t(pair_idx2, 1));
       Vector2d coeff_tz(coeff_t(pair_idx1, 2), coeff_t(pair_idx2, 2));
       vector<double> coeff_l1_norm(3);
-      coeff_l1_norm[0] = coeff_tx.lpNorm<1>();
+      coeff_l1_norm[0] = coeff_tx.lpNorm<1>(); //lp范数，返回的是最大值
       coeff_l1_norm[1] = coeff_ty.lpNorm<1>();
       coeff_l1_norm[2] = coeff_tz.lpNorm<1>();
+      //min_element返回的是迭代器，不是值
       int base_indicator = min_element(coeff_l1_norm.begin(),
                                        coeff_l1_norm.end()) -
                            coeff_l1_norm.begin();
-
       Vector3d model(0.0, 0.0, 0.0);
-      if (base_indicator == 0)
+      if (base_indicator == 0) //数组中第一个元素是最小的元素
       {
         Matrix2d A;
         A << coeff_ty, coeff_tz;
@@ -1216,9 +1213,8 @@ namespace msckf_vio
         model(2) = 1.0;
       }
 
-      // Find all the inliers among point pairs.
+      //根据两个点求出的模型剔除外点
       VectorXd error = coeff_t * model;
-
       vector<int> inlier_set;
       for (int i = 0; i < error.rows(); ++i)
       {
@@ -1228,12 +1224,11 @@ namespace msckf_vio
           inlier_set.push_back(i);
       }
 
-      // If the number of inliers is small, the current
-      // model is probably wrong.
+      // 如果内点太少了，那就跳过这次循环重新来过
       if (inlier_set.size() < 0.2 * pts1_undistorted.size())
         continue;
 
-      // Refit the model using all of the possible inliers.
+      // 使用新的内点重新拟合模型
       VectorXd coeff_tx_better(inlier_set.size());
       VectorXd coeff_ty_better(inlier_set.size());
       VectorXd coeff_tz_better(inlier_set.size());
@@ -1243,7 +1238,6 @@ namespace msckf_vio
         coeff_ty_better(i) = coeff_t(inlier_set[i], 1);
         coeff_tz_better(i) = coeff_t(inlier_set[i], 2);
       }
-
       Vector3d model_better(0.0, 0.0, 0.0);
       if (base_indicator == 0)
       {
@@ -1276,14 +1270,12 @@ namespace msckf_vio
         model_better(2) = 1.0;
       }
 
-      // Compute the error and upate the best model if possible.
+      //计算一下新的模型是否更好，如果更好那就将其更新
       VectorXd new_error = coeff_t * model_better;
-
       double this_error = 0.0;
       for (const auto &inlier_idx : inlier_set)
         this_error += std::abs(new_error(inlier_idx));
       this_error /= inlier_set.size();
-
       if (inlier_set.size() > best_inlier_set.size())
       {
         best_error = this_error;
@@ -1291,15 +1283,11 @@ namespace msckf_vio
       }
     }
 
-    // Fill in the markers.
+    // 将内点标记
     inlier_markers.clear();
     inlier_markers.resize(pts1.size(), 0);
     for (const auto &inlier_idx : best_inlier_set)
       inlier_markers[inlier_idx] = 1;
-
-    //printf("inlier ratio: %lu/%lu\n",
-    //    best_inlier_set.size(), inlier_markers.size());
-
     return;
   }
 
