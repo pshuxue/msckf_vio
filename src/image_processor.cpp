@@ -255,23 +255,18 @@ namespace msckf_vio
       drawFeaturesStereo();
     }
 
-    //ros::Time start_time = ros::Time::now();
-    //updateFeatureLifetime();
-    //ROS_INFO("Statistics: %f",
-    //    (ros::Time::now()-start_time).toSec());
-
-    // Publish features in the current image.
+    //将处理信息发送出去
     ros::Time start_time = ros::Time::now();
     publish();
     //ROS_INFO("Publishing: %f",
     //    (ros::Time::now()-start_time).toSec());
 
-    // Update the previous image and previous features.
-    cam0_prev_img_ptr = cam0_curr_img_ptr;
-    prev_features_ptr = curr_features_ptr;
-    std::swap(prev_cam0_pyramid_, curr_cam0_pyramid_);
+    // 更新过去和现在的数据结构
+    cam0_prev_img_ptr = cam0_curr_img_ptr;             //图像的原始数据
+    prev_features_ptr = curr_features_ptr;             //cam0和cam1的点对更新
+    std::swap(prev_cam0_pyramid_, curr_cam0_pyramid_); //金字塔用于光流跟踪
 
-    // Initialize the current features to empty vectors.
+    // 由于上面刚刚保存，这里将当前的点对清空
     curr_features_ptr.reset(new GridFeatures());
     for (int code = 0; code <
                        processor_config.grid_row * processor_config.grid_col;
@@ -279,10 +274,10 @@ namespace msckf_vio
     {
       (*curr_features_ptr)[code] = vector<FeatureMetaData>(0);
     }
-
     return;
   }
 
+  //IMU的回调函数，主要就是将IMU数据加入缓冲区
   void ImageProcessor::imuCallback(
       const sensor_msgs::ImuConstPtr &msg)
   {
@@ -692,7 +687,7 @@ namespace msckf_vio
     return;
   }
 
-  //光流跟踪会使得点数变少，所以此处补充新的光流点
+  //光流跟踪会使得点数变少，所以此处补充新的光流点（跟踪的是cam0）
   void ImageProcessor::addNewFeatures()
   {
     const Mat &curr_img = cam0_curr_img_ptr->image;
@@ -727,9 +722,9 @@ namespace msckf_vio
       }
     }
 
-    // 提取新的特征点
+    // 提取新的特征点，都是针对cam0
     vector<KeyPoint> new_features(0);
-    detector_ptr->detect(curr_img, new_features, mask);
+    detector_ptr->detect(curr_img, new_features, mask); //使用mask使得特征提取不会出现与先前重复的情况
 
     // 创建新的格子，将新提取的特征点放入格子
     vector<vector<KeyPoint>> new_feature_sieve(
@@ -756,16 +751,14 @@ namespace msckf_vio
     }
     int detected_new_features = new_features.size();
 
-    // Find the stereo matched points for the newly
-    // detected features.
+    // 将新的特征点，即将cam0的特征点使用stereoMatch函数根据两个相机外参进行匹配
+    //找到cam1中与cam0对应的特征点
     vector<cv::Point2f> cam0_points(new_features.size());
     for (int i = 0; i < new_features.size(); ++i)
       cam0_points[i] = new_features[i].pt;
-
     vector<cv::Point2f> cam1_points(0);
     vector<unsigned char> inlier_markers(0);
     stereoMatch(cam0_points, cam1_points, inlier_markers);
-
     vector<cv::Point2f> cam0_inliers(0);
     vector<cv::Point2f> cam1_inliers(0);
     vector<float> response_inliers(0);
@@ -779,7 +772,6 @@ namespace msckf_vio
     }
 
     int matched_new_features = cam0_inliers.size();
-
     if (matched_new_features < 5 &&
         static_cast<double>(matched_new_features) /
                 static_cast<double>(detected_new_features) <
@@ -787,37 +779,33 @@ namespace msckf_vio
       ROS_WARN("Images at [%f] seems unsynced...",
                cam0_curr_img_ptr->header.stamp.toSec());
 
-    // Group the features into grids
+    // 将新提取出的特征点对存放在下面的变量grid_new_features中，再根据响应值排序
     GridFeatures grid_new_features;
     for (int code = 0; code <
                        processor_config.grid_row * processor_config.grid_col;
          ++code)
       grid_new_features[code] = vector<FeatureMetaData>(0);
-
     for (int i = 0; i < cam0_inliers.size(); ++i)
     {
       const cv::Point2f &cam0_point = cam0_inliers[i];
       const cv::Point2f &cam1_point = cam1_inliers[i];
       const float &response = response_inliers[i];
-
       int row = static_cast<int>(cam0_point.y / grid_height);
       int col = static_cast<int>(cam0_point.x / grid_width);
       int code = row * processor_config.grid_col + col;
-
       FeatureMetaData new_feature;
       new_feature.response = response;
       new_feature.cam0_point = cam0_point;
       new_feature.cam1_point = cam1_point;
       grid_new_features[code].push_back(new_feature);
     }
-
-    // Sort the new features in each grid based on its response.
     for (auto &item : grid_new_features)
       std::sort(item.second.begin(), item.second.end(),
                 &ImageProcessor::featureCompareByResponse);
 
+    //遍历每个格子，如果某个格子在前面track跟踪的特征点已经足够多，那就不用再加入新的点
+    //否则就将新提取的特征点存入，直到达到阈值grid_min_feature_num
     int new_added_feature_num = 0;
-    // Collect new features within each grid with high response.
     for (int code = 0; code <
                        processor_config.grid_row * processor_config.grid_col;
          ++code)
@@ -841,13 +829,10 @@ namespace msckf_vio
         ++new_added_feature_num;
       }
     }
-
-    //printf("\033[0;33m detected: %d; matched: %d; new added feature: %d\033[0m\n",
-    //    detected_new_features, matched_new_features, new_added_feature_num);
-
     return;
   }
 
+  //遍历每个格子，如果格子中特征点过多，那就将其抹掉一定数量
   void ImageProcessor::pruneGridFeatures()
   {
     for (auto &item : *curr_features_ptr)
@@ -1037,7 +1022,6 @@ namespace msckf_vio
       const double &success_probability,
       vector<int> &inlier_markers)
   {
-
     // Check the size of input point size.
     if (pts1.size() != pts2.size())
       ROS_ERROR("Sets of different size (%lu and %lu) are used...",
@@ -1290,6 +1274,8 @@ namespace msckf_vio
     return;
   }
 
+  //将特征提取结果发布出去，主要是发布两个数据，一个是特征信息，即同一个特征在cam0和cam1中的像素坐标
+  //一个是track信息，即追踪、匹配、RANSAC前后特征数量
   void ImageProcessor::publish()
   {
 
@@ -1421,6 +1407,7 @@ namespace msckf_vio
     waitKey(5);
   }
 
+  //在双目相机上画特征点和线。并将图像发布
   void ImageProcessor::drawFeaturesStereo()
   {
 

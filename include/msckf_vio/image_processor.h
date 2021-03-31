@@ -56,8 +56,8 @@ namespace msckf_vio
     {
       int grid_row;
       int grid_col;
-      int grid_min_feature_num; //每
-      int grid_max_feature_num;
+      int grid_min_feature_num; //每个图像网格中最少存在的特征点数
+      int grid_max_feature_num; //每个图像网格中最多存在的特征点数，如果太多在处理过程中会被抹掉
 
       int pyramid_levels; //金字塔层数
       int patch_size;     //图像金字塔窗口尺寸
