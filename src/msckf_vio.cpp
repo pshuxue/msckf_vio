@@ -235,6 +235,7 @@ namespace msckf_vio
     return true;
   }
 
+  //主要是将数据放入缓冲区，然后将重力向量初始化
   void MsckfVio::imuCallback(
       const sensor_msgs::ImuConstPtr &msg)
   {
@@ -282,7 +283,7 @@ namespace msckf_vio
     double gravity_norm = gravity_imu.norm();
     IMUState::gravity = Vector3d(0.0, 0.0, -gravity_norm); //世界系中的重力加速度
 
-    //根据世界系的重力和imu系的重力能够求解出imu相对世界坐标的旋转
+    //根据世界系的重力和imu系的重力能够求解出imu相对世界坐标的旋转,(转轴是两个向量的叉乘)
     Quaterniond q0_i_w = Quaterniond::FromTwoVectors(
         gravity_imu, -IMUState::gravity);
 
@@ -371,13 +372,11 @@ namespace msckf_vio
       const CameraMeasurementConstPtr &msg)
   {
 
-    // Return if the gravity vector has not been set.
+    // 等待重力向量初始化之后再运行
     if (!is_gravity_set)
       return;
 
-    // Start the system if the first image is received.
-    // The frame where the first image is received will be
-    // the origin.
+    // 将收到图像的第一帧作为原点进行滤波
     if (is_first_img)
     {
       is_first_img = false;
@@ -516,6 +515,7 @@ namespace msckf_vio
     return;
   }
 
+  //批处理IMU的数据，将上一帧图像和当前帧图像之间的imu数据进行处理
   void MsckfVio::batchImuProcessing(const double &time_bound)
   {
     // Counter how many IMU msgs in the buffer are used.
@@ -524,20 +524,20 @@ namespace msckf_vio
     for (const auto &imu_msg : imu_msg_buffer)
     {
       double imu_time = imu_msg.header.stamp.toSec();
-      if (imu_time < state_server.imu_state.time)
+      if (imu_time < state_server.imu_state.time) //时间太早了，早于上一帧图像的时间
       {
         ++used_imu_msg_cntr;
         continue;
       }
-      if (imu_time > time_bound)
+      if (imu_time > time_bound) //时间太近了，超过了当前时间的时间戳
         break;
 
-      // Convert the msgs.
+      //数据转化
       Vector3d m_gyro, m_acc;
       tf::vectorMsgToEigen(imu_msg.angular_velocity, m_gyro);
       tf::vectorMsgToEigen(imu_msg.linear_acceleration, m_acc);
 
-      // Execute process model.
+      //处理一帧imu数据
       processModel(imu_time, m_gyro, m_acc);
       ++used_imu_msg_cntr;
     }
@@ -552,12 +552,12 @@ namespace msckf_vio
     return;
   }
 
+  //这个函数用于一帧imu数据的处理，输入的是imu的时间戳和imu的加速度和角速度数据
   void MsckfVio::processModel(const double &time,
                               const Vector3d &m_gyro,
                               const Vector3d &m_acc)
   {
-
-    // Remove the bias from the measured gyro and acceleration
+    // 去掉加速度和角速度的偏置
     IMUState &imu_state = state_server.imu_state;
     Vector3d gyro = m_gyro - imu_state.gyro_bias;
     Vector3d acc = m_acc - imu_state.acc_bias;
