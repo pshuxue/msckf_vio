@@ -594,7 +594,7 @@ namespace msckf_vio
     Matrix<double, 21, 21> Phi = Matrix<double, 21, 21>::Identity() +
                                  Fdt + 0.5 * Fdt_square + (1.0 / 6.0) * Fdt_cube;
 
-    // Propogate the state using 4th order Runge-Kutta
+    // 不同于vins的中值递推法，此处是精确度更高的一种4阶Runge-Kutta方法，根据imu数据预测下一帧imu的位姿
     predictNewState(dtime, gyro, acc);
 
     // Modify the transition matrix
@@ -652,6 +652,7 @@ namespace msckf_vio
     return;
   }
 
+  //运动方程的前向递推，使用imu的数据求出当前的位姿，利用的是 Runge-Kutta方法
   void MsckfVio::predictNewState(const double &dt,
                                  const Vector3d &gyro,
                                  const Vector3d &acc)
@@ -718,7 +719,6 @@ namespace msckf_vio
     quaternionNormalize(q);
     v = v + dt / 6 * (k1_v_dot + 2 * k2_v_dot + 2 * k3_v_dot + k4_v_dot);
     p = p + dt / 6 * (k1_p_dot + 2 * k2_p_dot + 2 * k3_p_dot + k4_p_dot);
-
     return;
   }
 
