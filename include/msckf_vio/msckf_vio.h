@@ -72,7 +72,7 @@ namespace msckf_vio
       struct StateServer
       {
          IMUState imu_state;
-         CamStateServer cam_states;
+         CamStateServer cam_states; //因为msckf中会维持多个相机的状态，每个状态有一个id，所以这里使用的是map
 
          // 状态协方差
          Eigen::MatrixXd state_cov;

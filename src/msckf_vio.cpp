@@ -387,19 +387,18 @@ namespace msckf_vio
     static int critical_time_cntr = 0;
     double processing_start_time = ros::Time::now().toSec();
 
-    // Propogate the IMU state.
-    // that are received before the image msg.
+    //每接收一帧图像，就将前一帧图像和当前帧的图像之间的imu状态进行预测传播
     ros::Time start_time = ros::Time::now();
     batchImuProcessing(msg->header.stamp.toSec());
     double imu_processing_time = (ros::Time::now() - start_time).toSec();
 
-    // Augment the state vector.
+    //上面imu的状态已经传递到了当前的图像时刻，但是目前的状态中还没有图像最新的状态。这里根据最新的imu状态和外参推导当前时刻图像的预测状态
+    //主要是将当前的状态进行增广，添加相机状态
     start_time = ros::Time::now();
     stateAugmentation(msg->header.stamp.toSec());
     double state_augmentation_time = (ros::Time::now() - start_time).toSec();
 
-    // Add new observations for existing features or new
-    // features in the map server.
+    ///数据关联，对于新来的像素点与现有维护的图像状态和地图进行数据关联
     start_time = ros::Time::now();
     addFeatureObservations(msg);
     double add_observations_time = (ros::Time::now() - start_time).toSec();
@@ -515,7 +514,7 @@ namespace msckf_vio
     return;
   }
 
-  //批处理IMU的数据，将上一帧图像和当前帧图像之间的imu数据进行处理
+  //批处理IMU的数据，将上一帧图像和当前帧图像之间的imu数据进行处理，imu的预测模型不停的向前预测更新imu的状态是方差
   void MsckfVio::batchImuProcessing(const double &time_bound)
   {
     // Counter how many IMU msgs in the buffer are used.
@@ -524,7 +523,7 @@ namespace msckf_vio
     for (const auto &imu_msg : imu_msg_buffer)
     {
       double imu_time = imu_msg.header.stamp.toSec();
-      if (imu_time < state_server.imu_state.time) //时间太早了，早于上一帧图像的时间
+      if (imu_time < state_server.imu_state.time) //时间太早了，早于上一帧imu的时间
       {
         ++used_imu_msg_cntr;
         continue;
@@ -553,6 +552,7 @@ namespace msckf_vio
   }
 
   //这个函数用于一帧imu数据的处理，输入的是imu的时间戳和imu的加速度和角速度数据
+  //根据当前的状态，推导下一帧imu的状态和协方差
   void MsckfVio::processModel(const double &time,
                               const Vector3d &m_gyro,
                               const Vector3d &m_acc)
@@ -563,10 +563,9 @@ namespace msckf_vio
     Vector3d acc = m_acc - imu_state.acc_bias;
     double dtime = time - imu_state.time;
 
-    // Compute discrete transition and noise covariance matrix
+    //运动方程，FG是imu状态的雅克比，即：Ximu的导数=F*Ximu+G*Noise
     Matrix<double, 21, 21> F = Matrix<double, 21, 21>::Zero();
     Matrix<double, 21, 12> G = Matrix<double, 21, 12>::Zero();
-
     F.block<3, 3>(0, 0) = -skewSymmetric(gyro);
     F.block<3, 3>(0, 3) = -Matrix3d::Identity();
     F.block<3, 3>(6, 0) = -quaternionToRotation(
@@ -585,16 +584,14 @@ namespace msckf_vio
                                .transpose();
     G.block<3, 3>(9, 9) = Matrix3d::Identity();
 
-    // Approximate matrix exponential to the 3rd order,
-    // which can be considered to be accurate enough assuming
-    // dtime is within 0.01s.
+    //上面求出的是imu导数关于状态的雅克比，这里使用F近似二阶和三阶导，在使用泰勒展开近似运动方程
     Matrix<double, 21, 21> Fdt = F * dtime;
     Matrix<double, 21, 21> Fdt_square = Fdt * Fdt;
     Matrix<double, 21, 21> Fdt_cube = Fdt_square * Fdt;
     Matrix<double, 21, 21> Phi = Matrix<double, 21, 21>::Identity() +
                                  Fdt + 0.5 * Fdt_square + (1.0 / 6.0) * Fdt_cube;
 
-    // 不同于vins的中值递推法，此处是精确度更高的一种4阶Runge-Kutta方法，根据imu数据预测下一帧imu的位姿
+    // 不同于vins的中值递推法，此处是精确度更高的一种4阶Runge-Kutta方法，根据imu数据预测下一帧imu的pvq
     predictNewState(dtime, gyro, acc);
 
     // Modify the transition matrix
@@ -618,7 +615,7 @@ namespace msckf_vio
                   IMUState::gravity;
     Phi.block<3, 3>(12, 0) = A2 - (A2 * u - w2) * s;
 
-    // Propogate the state covariance matrix.
+    //预测下一帧imu的协方差矩阵
     Matrix<double, 21, 21> Q = Phi * G * state_server.continuous_noise_cov *
                                G.transpose() * Phi.transpose() * dtime;
     state_server.state_cov.block<21, 21>(0, 0) =
@@ -722,23 +719,24 @@ namespace msckf_vio
     return;
   }
 
+  //上面imu的状态已经传递到了当前的图像时刻，但是目前的状态中还没有图像最新的状态。这里根据最新的imu状态和外参推导当前时刻图像的预测状态
+  //主要是将当前的状态进行增广，添加相机状态，这里在卡尔曼滤波中本质上还是预测步骤
   void MsckfVio::stateAugmentation(const double &time)
   {
-
     const Matrix3d &R_i_c = state_server.imu_state.R_imu_cam0;
     const Vector3d &t_c_i = state_server.imu_state.t_cam0_imu;
 
-    // Add a new camera state to the state server.
+    // 将当前的状态中追加相机状态，相机状态使用的是最新的imu状态加外参预测得到
     Matrix3d R_w_i = quaternionToRotation(
         state_server.imu_state.orientation);
     Matrix3d R_w_c = R_i_c * R_w_i;
     Vector3d t_c_w = state_server.imu_state.position +
                      R_w_i.transpose() * t_c_i;
 
+    //相机状态写入状态变量中
     state_server.cam_states[state_server.imu_state.id] =
         CAMState(state_server.imu_state.id);
     CAMState &cam_state = state_server.cam_states[state_server.imu_state.id];
-
     cam_state.time = time;
     cam_state.orientation = rotationToQuaternion(R_w_c);
     cam_state.position = t_c_w;
@@ -746,10 +744,8 @@ namespace msckf_vio
     cam_state.orientation_null = cam_state.orientation;
     cam_state.position_null = cam_state.position;
 
-    // Update the covariance matrix of the state.
-    // To simplify computation, the matrix J below is the nontrivial block
-    // in Equation (16) in "A Multi-State Constraint Kalman Filter for Vision
-    // -aided Inertial Navigation".
+    //这里的公式与最新的s-msckf中的论文不同，采用的是"A Multi-State Constraint Kalman Filter for Vision aided Inertial Navigation"中的推导
+    //使用最新的雅克比对相机状态的协方差进行预测
     Matrix<double, 6, 21> J = Matrix<double, 6, 21>::Zero();
     J.block<3, 3>(0, 0) = R_i_c;
     J.block<3, 3>(0, 15) = Matrix3d::Identity();
@@ -785,6 +781,7 @@ namespace msckf_vio
     return;
   }
 
+  //数据关联
   void MsckfVio::addFeatureObservations(
       const CameraMeasurementConstPtr &msg)
   {
@@ -793,13 +790,12 @@ namespace msckf_vio
     int curr_feature_num = map_server.size();
     int tracked_feature_num = 0;
 
-    // Add new observations for existing features or new
-    // features in the map server.
+    //对发送来的像素点与现有图像和地图进行数据关联
     for (const auto &feature : msg->features)
     {
-      if (map_server.find(feature.id) == map_server.end())
+      if (map_server.find(feature.id) == map_server.end()) //原地图中找不到这个点
       {
-        // This is a new feature.
+        //这是新的地图点，初始化观测
         map_server[feature.id] = Feature(feature.id);
         map_server[feature.id].observations[state_id] =
             Vector4d(feature.u0, feature.v0,
@@ -807,7 +803,7 @@ namespace msckf_vio
       }
       else
       {
-        // This is an old feature.
+        // 旧点，直接加入新的观测，表示这个旧点被当前的最新图像帧观测到了
         map_server[feature.id].observations[state_id] =
             Vector4d(feature.u0, feature.v0,
                      feature.u1, feature.v1);
