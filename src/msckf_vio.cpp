@@ -942,8 +942,7 @@ namespace msckf_vio
       stack_cntr += 4;
     }
 
-    // Project the residual and Jacobians onto the nullspace
-    // of H_fj.
+    // 由于此处H_fj的维度是4M*3，所以H_fj的奇异值最多只有3个非零值，于是其左零空间维度至少有4M-3
     JacobiSVD<MatrixXd> svd_helper(H_fj, ComputeFullU | ComputeThinV);
     MatrixXd A = svd_helper.matrixU().rightCols(
         jacobian_row_size - 3);
@@ -1093,20 +1092,19 @@ namespace msckf_vio
 
   void MsckfVio::removeLostFeatures()
   {
-
     // Remove the features that lost track.
     // BTW, find the size the final Jacobian matrix and residual vector.
     int jacobian_row_size = 0;
-    vector<FeatureIDType> invalid_feature_ids(0);
+    vector<FeatureIDType> invalid_feature_ids(0); //存储那些observations值很小的特征点id
     vector<FeatureIDType> processed_feature_ids(0);
 
+    //遍历所有地图点
     for (auto iter = map_server.begin();
          iter != map_server.end(); ++iter)
     {
-      // Rename the feature to be checked.
       auto &feature = iter->second;
 
-      // Pass the features that are still being tracked.
+      // 判断这个特征点是否还有效
       if (feature.observations.find(state_server.imu_state.id) !=
           feature.observations.end())
         continue;
@@ -1116,33 +1114,28 @@ namespace msckf_vio
         continue;
       }
 
-      // Check if the feature can be initialized if it
-      // has not been.
+      // 看看这个特征点能否被成功的计算出深度
       if (!feature.is_initialized)
       {
-        if (!feature.checkMotion(state_server.cam_states))
+        if (!feature.checkMotion(state_server.cam_states)) //如果返回false，则说明相机的运动方向非常沿着特征点的视线方向
         {
           invalid_feature_ids.push_back(feature.id);
           continue;
         }
         else
         {
-          if (!feature.initializePosition(state_server.cam_states))
+          if (!feature.initializePosition(state_server.cam_states)) //先使用估计深度，再进行非线性优化的方法求解这个feature的深度
           {
-            invalid_feature_ids.push_back(feature.id);
+            invalid_feature_ids.push_back(feature.id); //优化失败，无效的feature
             continue;
           }
         }
       }
 
+      //成功初始化的特征点，雅克比的行数会增加(4n-3)，n是有多少个相机观测到了这个特征点
       jacobian_row_size += 4 * feature.observations.size() - 3;
-      processed_feature_ids.push_back(feature.id);
+      processed_feature_ids.push_back(feature.id); //将成功初始化的特征点保存
     }
-
-    //cout << "invalid/processed feature #: " <<
-    //  invalid_feature_ids.size() << "/" <<
-    //  processed_feature_ids.size() << endl;
-    //cout << "jacobian row #: " << jacobian_row_size << endl;
 
     // Remove the features that do not have enough measurements.
     for (const auto &feature_id : invalid_feature_ids)
@@ -1152,12 +1145,13 @@ namespace msckf_vio
     if (processed_feature_ids.size() == 0)
       return;
 
+    //初始化观测矩阵
     MatrixXd H_x = MatrixXd::Zero(jacobian_row_size,
                                   21 + 6 * state_server.cam_states.size());
     VectorXd r = VectorXd::Zero(jacobian_row_size);
     int stack_cntr = 0;
 
-    // Process the features which lose track.
+    // 对于跟踪成功的点，构建雅克比矩阵和残差项
     for (const auto &feature_id : processed_feature_ids)
     {
       auto &feature = map_server[feature_id];
@@ -1168,7 +1162,7 @@ namespace msckf_vio
 
       MatrixXd H_xj;
       VectorXd r_j;
-      featureJacobian(feature.id, cam_state_ids, H_xj, r_j);
+      featureJacobian(feature.id, cam_state_ids, H_xj, r_j); //得到雅克比矩阵（已经经过了左零空间的处理）
 
       if (gatingTest(H_xj, r_j, cam_state_ids.size() - 1))
       {
@@ -1177,8 +1171,7 @@ namespace msckf_vio
         stack_cntr += H_xj.rows();
       }
 
-      // Put an upper bound on the row size of measurement Jacobian,
-      // which helps guarantee the executation time.
+      // 如果点数太多，会导致雅克比矩阵维度过大，此处去除
       if (stack_cntr > 1500)
         break;
     }
@@ -1186,7 +1179,7 @@ namespace msckf_vio
     H_x.conservativeResize(stack_cntr, H_x.cols());
     r.conservativeResize(stack_cntr);
 
-    // Perform the measurement update step.
+    // 卡尔曼的更新步骤
     measurementUpdate(H_x, r);
 
     // Remove all processed features from the map.
@@ -1196,10 +1189,10 @@ namespace msckf_vio
     return;
   }
 
+  //去掉倒数后三帧中平移和旋转很小的帧
   void MsckfVio::findRedundantCamStates(
       vector<StateIDType> &rm_cam_state_ids)
   {
-
     // Move the iterator to the key position.
     auto key_cam_state_iter = state_server.cam_states.end();
     for (int i = 0; i < 4; ++i)
@@ -1208,14 +1201,13 @@ namespace msckf_vio
     ++cam_state_iter;
     auto first_cam_state_iter = state_server.cam_states.begin();
 
-    // Pose of the key camera state.
+    // 找到倒数第三帧
     const Vector3d key_position =
         key_cam_state_iter->second.position;
     const Matrix3d key_rotation = quaternionToRotation(
         key_cam_state_iter->second.orientation);
 
-    // Mark the camera states to be removed based on the
-    // motion between states.
+    //倒数后两帧中，平移和旋转都没有发生显著变化的那些帧去掉
     for (int i = 0; i < 2; ++i)
     {
       const Vector3d position =
@@ -1248,13 +1240,14 @@ namespace msckf_vio
     return;
   }
 
+  //去掉一些相机的状态，防止优化变量越来越多，使计算变复杂
   void MsckfVio::pruneCamStateBuffer()
   {
 
     if (state_server.cam_states.size() < max_cam_state_size)
       return;
 
-    // Find two camera states to be removed.
+    // 后面的几帧旋转和平移小的去掉
     vector<StateIDType> rm_cam_state_ids(0);
     findRedundantCamStates(rm_cam_state_ids);
 

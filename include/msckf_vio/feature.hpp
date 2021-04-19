@@ -140,7 +140,7 @@ namespace msckf_vio
     // id for next feature
     static FeatureIDType next_id;
 
-    // key：图像id     value：图像坐标
+    // key：图像id     value：图像坐标(左右相机组成4维)
     std::map<StateIDType, Eigen::Vector4d, std::less<StateIDType>,
              Eigen::aligned_allocator<
                  std::pair<const StateIDType, Eigen::Vector4d>>>
@@ -230,6 +230,7 @@ namespace msckf_vio
     return;
   }
 
+  //已知两帧的相对位姿，和一个特征点在两帧中的像素坐标，求解深度（此程序没有考虑内参）
   void Feature::generateInitialGuess(
       const Eigen::Isometry3d &T_c1_c2, const Eigen::Vector2d &z1,
       const Eigen::Vector2d &z2, Eigen::Vector3d &p) const
@@ -253,6 +254,8 @@ namespace msckf_vio
     return;
   }
 
+  //判断这个特征点的所有观测的运动方向和运动距离，在垂直特征点的方向上的运动距离越大，就返回true
+  //如果运动方向是沿着特征点的投射方向，那就会返回false
   bool Feature::checkMotion(
       const CamStateServer &cam_states) const
   {
@@ -300,6 +303,7 @@ namespace msckf_vio
       return false;
   }
 
+  //这个函数的目的是初始化一个特征点的3d坐标
   bool Feature::initializePosition(
       const CamStateServer &cam_states)
   {
@@ -313,19 +317,15 @@ namespace msckf_vio
 
     for (auto &m : observations)
     {
-      // TODO: This should be handled properly. Normally, the
-      //    required camera states should all be available in
-      //    the input cam_states buffer.
+      //在输入的相机状态中没有找到该特征点的这个观测m，跳过
       auto cam_state_iter = cam_states.find(m.first);
       if (cam_state_iter == cam_states.end())
         continue;
 
-      // Add the measurement.
+      // 找到了就取像素坐标加入measurements，位姿加入cam_poses（此处左右相机加入了同一个数据结构，不过是彼此对应的）
       measurements.push_back(m.second.head<2>());
       measurements.push_back(m.second.tail<2>());
 
-      // This camera pose will take a vector from this camera frame
-      // to the world frame.
       Eigen::Isometry3d cam0_pose;
       cam0_pose.linear() = quaternionToRotation(
                                cam_state_iter->second.orientation)
@@ -339,14 +339,12 @@ namespace msckf_vio
       cam_poses.push_back(cam1_pose);
     }
 
-    // All camera poses should be modified such that it takes a
-    // vector from the first camera frame in the buffer to this
-    // camera frame.
+    // 取出观测的第一帧图像作为原点，后续所有图像的位姿修正为相对这第一帧图像的位姿
     Eigen::Isometry3d T_c0_w = cam_poses[0];
     for (auto &pose : cam_poses)
       pose = pose.inverse() * T_c0_w;
 
-    // Generate initial guess
+    //根据目前的位姿和像素点，初始化这个3d点的初值（并不准）
     Eigen::Vector3d initial_position(0.0, 0.0, 0.0);
     generateInitialGuess(cam_poses[cam_poses.size() - 1], measurements[0],
                          measurements[measurements.size() - 1], initial_position);
@@ -355,7 +353,8 @@ namespace msckf_vio
         initial_position(1) / initial_position(2),
         1.0 / initial_position(2));
 
-    // Apply Levenberg-Marquart method to solve for the 3d position.
+    // 接下来使用LM优化算法对这个3d点进行优化，作者没有使用优化库，手写的雅克比进行迭代。。。
+    //是个狠人，最终返回是否初始化成功
     double lambda = optimization_config.initial_damping;
     int inner_loop_cntr = 0;
     int outer_loop_cntr = 0;
@@ -370,7 +369,6 @@ namespace msckf_vio
       cost(cam_poses[i], solution, measurements[i], this_cost);
       total_cost += this_cost;
     }
-
     // Outer loop.
     do
     {
