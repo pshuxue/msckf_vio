@@ -317,7 +317,7 @@ namespace msckf_vio
 
     for (auto &m : observations)
     {
-      //在输入的相机状态中没有找到该特征点的这个观测m，跳过
+      //在输入的相机状态中没有找到该特征点的这个观测，跳过
       auto cam_state_iter = cam_states.find(m.first);
       if (cam_state_iter == cam_states.end())
         continue;
@@ -354,7 +354,7 @@ namespace msckf_vio
         1.0 / initial_position(2));
 
     // 接下来使用LM优化算法对这个3d点进行优化，作者没有使用优化库，手写的雅克比进行迭代。。。
-    //是个狠人，最终返回是否初始化成功
+    //是个狠人，最终返回是否初始化成功(固定位姿，只优化3d点)
     double lambda = optimization_config.initial_damping;
     int inner_loop_cntr = 0;
     int outer_loop_cntr = 0;

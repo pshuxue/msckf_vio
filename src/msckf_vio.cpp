@@ -219,8 +219,7 @@ namespace msckf_vio
     state_server.continuous_noise_cov.block<3, 3>(9, 9) =
         Matrix3d::Identity() * IMUState::acc_bias_noise;
 
-    // Initialize the chi squared test table with confidence
-    // level 0.95.
+    // 用于卡方检验
     for (int i = 1; i < 100; ++i)
     {
       boost::math::chi_squared chi_squared_dist(i);
@@ -403,11 +402,14 @@ namespace msckf_vio
     addFeatureObservations(msg);
     double add_observations_time = (ros::Time::now() - start_time).toSec();
 
-    // Perform measurement update if necessary.
+    //接下来是更新步骤，原2007版MSCKF中的论文在更新的时机上有两种，一种是当一个特征点被跟踪了很久，突然跟丢了的时候将这些跟丢点的点进行一次更新然后删除
+    //第二种是窗口中的帧已经达到了最大值，将过去的帧抹掉，这里类似
+    // 第一种更新：找那些观测值较多且已经跟丢的特征点进行更新
     start_time = ros::Time::now();
     removeLostFeatures();
     double remove_lost_features_time = (ros::Time::now() - start_time).toSec();
 
+    //第二种更新：去掉滑窗中后面帧后仍然大于2的观测的特征点进行更新，并将对应的协方差去掉
     start_time = ros::Time::now();
     pruneCamStateBuffer();
     double prune_cam_states_time = (ros::Time::now() - start_time).toSec();
@@ -818,6 +820,7 @@ namespace msckf_vio
     return;
   }
 
+  //一个点一对相机的残差和雅克比构建，残差有左右双目于是是4维，状态是旋转和平移是6维，空间点是3维
   void MsckfVio::measurementJacobian(
       const StateIDType &cam_state_id,
       const FeatureIDType &feature_id,
@@ -894,6 +897,7 @@ namespace msckf_vio
     return;
   }
 
+  //根据空间点对残差的雅克比，使用奇异值分解构建左零空间，注意这里构建的是多个相机相对于一个空间点的残差和雅克比，所以理论上残差是4n维的，但是经过了左零空间处理变成了4n-3维
   void MsckfVio::featureJacobian(
       const FeatureIDType &feature_id,
       const std::vector<StateIDType> &cam_state_ids,
@@ -929,7 +933,7 @@ namespace msckf_vio
       Matrix<double, 4, 6> H_xi = Matrix<double, 4, 6>::Zero();
       Matrix<double, 4, 3> H_fi = Matrix<double, 4, 3>::Zero();
       Vector4d r_i = Vector4d::Zero();
-      measurementJacobian(cam_id, feature.id, H_xi, H_fi, r_i);
+      measurementJacobian(cam_id, feature.id, H_xi, H_fi, r_i); //一个点一对相机的残差和雅克比构建
 
       auto cam_state_iter = state_server.cam_states.find(cam_id);
       int cam_state_cntr = std::distance(
@@ -945,7 +949,7 @@ namespace msckf_vio
     // 由于此处H_fj的维度是4M*3，所以H_fj的奇异值最多只有3个非零值，于是其左零空间维度至少有4M-3
     JacobiSVD<MatrixXd> svd_helper(H_fj, ComputeFullU | ComputeThinV);
     MatrixXd A = svd_helper.matrixU().rightCols(
-        jacobian_row_size - 3);
+        jacobian_row_size - 3); //A就是左零空间
 
     H_x = A.transpose() * H_xj;
     r = A.transpose() * r_j;
@@ -953,6 +957,7 @@ namespace msckf_vio
     return;
   }
 
+  //更新步骤
   void MsckfVio::measurementUpdate(
       const MatrixXd &H, const VectorXd &r)
   {
@@ -962,15 +967,15 @@ namespace msckf_vio
 
     // Decompose the final Jacobian matrix to reduce computational
     // complexity as in Equation (28), (29).
-    MatrixXd H_thin;
-    VectorXd r_thin;
+    MatrixXd H_thin; //最终表示的是 论文中使用QR分解后经过变换得到的TH
+    VectorXd r_thin; //最终表示的是 论文中使用QR分解得到的残差rn
 
     if (H.rows() > H.cols())
     {
-      // Convert H to a sparse matrix.
+      // 把雅克比变成稀疏矩阵
       SparseMatrix<double> H_sparse = H.sparseView();
 
-      // Perform QR decompostion on H_sparse.
+      // Perform QR decompostion on H_sparse. 稀疏矩阵的QR分解
       SPQR<SparseMatrix<double>> spqr_helper;
       spqr_helper.setSPQROrdering(SPQR_ORDERING_NATURAL);
       spqr_helper.compute(H_sparse);
@@ -982,13 +987,6 @@ namespace msckf_vio
 
       H_thin = H_temp.topRows(21 + state_server.cam_states.size() * 6);
       r_thin = r_temp.head(21 + state_server.cam_states.size() * 6);
-
-      //HouseholderQR<MatrixXd> qr_helper(H);
-      //MatrixXd Q = qr_helper.householderQ();
-      //MatrixXd Q1 = Q.leftCols(21+state_server.cam_states.size()*6);
-
-      //H_thin = Q1.transpose() * H;
-      //r_thin = Q1.transpose() * r;
     }
     else
     {
@@ -996,19 +994,19 @@ namespace msckf_vio
       r_thin = r;
     }
 
-    // Compute the Kalman gain.
+    // Compute the Kalman gain. 卡尔曼增益
     const MatrixXd &P = state_server.state_cov;
     MatrixXd S = H_thin * P * H_thin.transpose() +
                  Feature::observation_noise * MatrixXd::Identity(
                                                   H_thin.rows(), H_thin.rows());
     //MatrixXd K_transpose = S.fullPivHouseholderQr().solve(H_thin*P);
-    MatrixXd K_transpose = S.ldlt().solve(H_thin * P);
+    MatrixXd K_transpose = S.ldlt().solve(H_thin * P); //通过解方程的方法获得
     MatrixXd K = K_transpose.transpose();
 
     // Compute the error of the state.
     VectorXd delta_x = K * r_thin;
 
-    // Update the IMU state.
+    // Update the IMU state.更新的是delta，后面还需要将这些delta量加到状态变量中
     const VectorXd &delta_x_imu = delta_x.head<21>();
 
     if ( //delta_x_imu.segment<3>(0).norm() > 0.15 ||
@@ -1023,6 +1021,7 @@ namespace msckf_vio
       //return;
     }
 
+    //将delta中的变量加到系统的状态变量中(imu)
     const Vector4d dq_imu =
         smallAngleQuaternion(delta_x_imu.head<3>());
     state_server.imu_state.orientation = quaternionMultiplication(
@@ -1031,7 +1030,6 @@ namespace msckf_vio
     state_server.imu_state.velocity += delta_x_imu.segment<3>(6);
     state_server.imu_state.acc_bias += delta_x_imu.segment<3>(9);
     state_server.imu_state.position += delta_x_imu.segment<3>(12);
-
     const Vector4d dq_extrinsic =
         smallAngleQuaternion(delta_x_imu.segment<3>(15));
     state_server.imu_state.R_imu_cam0 = quaternionToRotation(
@@ -1066,6 +1064,7 @@ namespace msckf_vio
     return;
   }
 
+  //检验是否应该将这个块(多相机和一个特征点)加入总的雅克比
   bool MsckfVio::gatingTest(
       const MatrixXd &H, const VectorXd &r, const int &dof)
   {
@@ -1074,9 +1073,6 @@ namespace msckf_vio
     MatrixXd P2 = Feature::observation_noise *
                   MatrixXd::Identity(H.rows(), H.rows());
     double gamma = r.transpose() * (P1 + P2).ldlt().solve(r);
-
-    //cout << dof << " " << gamma << " " <<
-    //  chi_squared_test_table[dof] << " ";
 
     if (gamma < chi_squared_test_table[dof])
     {
@@ -1090,6 +1086,8 @@ namespace msckf_vio
     }
   }
 
+  //将有效的特征点进行深度计算并构造雅克比和残差，然后进行卡尔曼的更新步骤，最后将处理过的点从地图中删掉
+  //这个更新是将地图中所有的观测较多的地图点且当前帧已经跟丢了的进行一次更新，更新之后将这些地图点从地图中删掉
   void MsckfVio::removeLostFeatures()
   {
     // Remove the features that lost track.
@@ -1104,7 +1102,7 @@ namespace msckf_vio
     {
       auto &feature = iter->second;
 
-      // 判断这个特征点是否还有效
+      // 判断这个特征点是否被跟丢，注意：如果被跟丢了才会通过这条语句向下执行，如果没有跟丢那就返回，这是MSCKF的典型更新策略
       if (feature.observations.find(state_server.imu_state.id) !=
           feature.observations.end())
         continue;
@@ -1132,7 +1130,9 @@ namespace msckf_vio
         }
       }
 
-      //成功初始化的特征点，雅克比的行数会增加(4n-3)，n是有多少个相机观测到了这个特征点
+      //成功一个初始化的特征点，雅克比的行数会增加(4n-3)，n是有多少个相机观测到了这个特征点，之所以是4n-3，
+      //是因为:这一个特征点是3维的，但是由于会有n个相机观测到这个特征点，于是残差是4n(双目每张图片的像素残差是4维)，所以残差对于这个特征点的雅克比是4n*3
+      //所以其实这个雅克比矩阵转置的奇异值有(4n-3)个零值，对应的左零空间的维度就是(4n)*(4n-3)
       jacobian_row_size += 4 * feature.observations.size() - 3;
       processed_feature_ids.push_back(feature.id); //将成功初始化的特征点保存
     }
@@ -1145,7 +1145,7 @@ namespace msckf_vio
     if (processed_feature_ids.size() == 0)
       return;
 
-    //初始化观测矩阵
+    //初始化观测矩阵(这个在论文里面是已经乘完雅克比的观测矩阵了)
     MatrixXd H_x = MatrixXd::Zero(jacobian_row_size,
                                   21 + 6 * state_server.cam_states.size());
     VectorXd r = VectorXd::Zero(jacobian_row_size);
@@ -1162,16 +1162,16 @@ namespace msckf_vio
 
       MatrixXd H_xj;
       VectorXd r_j;
-      featureJacobian(feature.id, cam_state_ids, H_xj, r_j); //得到雅克比矩阵（已经经过了左零空间的处理）
+      featureJacobian(feature.id, cam_state_ids, H_xj, r_j); //得到雅克比矩阵（已经经过了左零空间的处理），注意这里构建的是多个相机相对于一个空间点的残差和雅克比
 
-      if (gatingTest(H_xj, r_j, cam_state_ids.size() - 1))
+      if (gatingTest(H_xj, r_j, cam_state_ids.size() - 1)) //卡方检验通过将雅克比组合在一起，这里加的每一个雅克比和残差代表的是一个特征点和多个相机
       {
         H_x.block(stack_cntr, 0, H_xj.rows(), H_xj.cols()) = H_xj;
         r.segment(stack_cntr, r_j.rows()) = r_j;
         stack_cntr += H_xj.rows();
       }
 
-      // 如果点数太多，会导致雅克比矩阵维度过大，此处去除
+      // 如果点数太多，会导致雅克比矩阵维度过大，后面的点就不用加入了，构建总的雅克比和残差完成
       if (stack_cntr > 1500)
         break;
     }
@@ -1240,10 +1240,10 @@ namespace msckf_vio
     return;
   }
 
-  //去掉一些相机的状态，防止优化变量越来越多，使计算变复杂
+  //去掉一些相机的状态，并去掉地图点对它的观测，去掉对应的系统状态和协方差，防止优化变量越来越多，使计算变复杂,最后再进行一次更新
+  //这次更新不像上面的更新找那些观测较多的特征点更新，而是去掉滑窗中的一些帧后还大于两个观测的就进行一次更新
   void MsckfVio::pruneCamStateBuffer()
   {
-
     if (state_server.cam_states.size() < max_cam_state_size)
       return;
 
